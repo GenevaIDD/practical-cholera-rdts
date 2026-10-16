@@ -1,0 +1,467 @@
+---
+title: "Which RDT Sampling Schemes Work, When, and Why"
+subtitle: "Technical note to *Cholera Surveillance with Rapid Diagnostic Tests: Sampling Approaches and Threats to Inference*"
+date: today
+format:
+  typst:
+    papersize: us-letter
+    margin:
+      x: 1in
+      y: 1in
+    fontsize: 10.5pt
+    section-numbering: "1.1"
+execute:
+  echo: false
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    dev: "pdf"     # no figures; avoids the Cairo-dependent svg device
+crossref:
+  eq-prefix: "Eq."
+---
+
+<!--
+Render from the repository root or this folder:
+    quarto render notebooks/sampling_schemes_note.qmd
+Inputs: data/sampled_data.csv, data/case_data_delta.csv, data/bias_aggregate.csv
+Functions: scripts/sampling_theory_funcs.R
+-->
+
+```{r}
+#| label: setup
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(knitr)
+source(here::here("scripts/sampling_theory_funcs.R"))
+
+sd <- load_tested(here::here("data/sampled_data.csv"))
+cd <- read_csv(here::here("data/case_data_delta.csv"), show_col_types = FALSE)
+ba <- read_csv(here::here("data/bias_aggregate.csv"), show_col_types = FALSE)
+
+# Formatting helpers
+num <- function(x, d = 2) formatC(x, format = "f", digits = d, big.mark = ",")
+num_auto <- function(x) ifelse(x %% 1 == 0, num(x, 0), num(x, 1))
+neg <- function(s) paste0("$", s, "$")          # signed numbers in math: a true minus sign in any locale
+sgn <- function(x, d = 1) neg(sprintf(paste0("%+.", d, "f"), x))
+span <- function(x, d = 2) paste0(num(min(x), d), "--", num(max(x), d))  # "--" becomes an en dash
+pct <- function(x, d = 0) paste0(num(x, d), "%")
+sci <- function(x) {
+  e <- floor(log10(x))
+  sprintf("$%.1f\\times10^{%d}$", x / 10^e, e)
+}
+italic_n <- function(s) sub(" n=", " *n*=", s, fixed = TRUE)
+site_val <- function(df, site, col) df[[col]][df$data_source == site]
+```
+
+```{r}
+#| label: compute
+fy <- fy_diagnostics(sd, note_strategies)
+dec <- weekly_error_decomp(sd, note_strategies)
+alloc <- allocation(sd, filter(note_strategies, col %in% c(
+  "sample_every2", "sample_every5", "sample_first_3_cases", "sample_first_3_cases_week"
+)))
+starts <- map_dfr(c(2, 5, 10), ~ everyn_start_bias(sd, .x))
+order1 <- arrival_order(sd, 1)
+order3 <- arrival_order(sd, 3)
+dow <- weekday_positivity(sd)
+kap_fy <- kappa_by_facility_year(sd)
+ccor <- caseload_positivity_cor(sd)
+icc <- icc_facility_day(sd)
+sev <- severe_annual_bias(cd)
+cov_d1 <- weekly_ci_coverage(cd, "First n daily (n=1)")
+agg <- aggregation_reduction(cd, ba, main_text_labels)
+
+n_fy <- n_distinct(paste(fy$data_source, fy$site, fy$year))
+med <- fy %>%
+  group_by(strategy, family, size) %>%
+  summarise(rho = median(rho), kappa = median(kappa), VIF = median(VIF),
+            rel = 100 * median(rel_diff), M = median(M), M0 = median(M0),
+            pooled_wins = sum(pooled_wins), .groups = "drop") %>%
+  arrange(match(strategy, note_strategies$label))
+fam <- function(f) filter(med, family == f)
+capped <- filter(med, family != "every")
+kap_fac <- kap_fy %>% group_by(data_source, site) %>% summarise(k = median(kappa), .groups = "drop")
+kappa_tab <- round(median(kap_fy$kappa), 2)
+weekly_wins <- function(f) span(n_fy - fam(f)$pooled_wins, 0)
+o3s <- filter(order3, data_source == "Sitakunda")
+dec_d3 <- filter(dec, strategy == "Daily n=3")
+dow_s <- filter(dow, data_source == "Sitakunda")
+dow_u <- filter(dow, data_source == "Uvira")
+day_min <- function(d) paste0(num(min(d$positivity), 1), "% (", d$day_full[which.min(d$positivity)], ")")
+day_max <- function(d) paste0(num(max(d$positivity), 1), "% (", d$day_full[which.max(d$positivity)], ")")
+alloc_val <- function(strat, site, col) alloc[[col]][alloc$strategy == strat & alloc$data_source == site]
+```
+
+```{r}
+#| label: claims
+# Stop the render if data changes invalidate a qualitative statement in the text
+# thank you Claude for this nifty bit! 
+
+claim <- function(ok, what) {
+  if (!isTRUE(all(ok))) stop("Statement in the text no longer holds: ", what, call. = FALSE)
+}
+claim(all(sd$sample_every2 == as.numeric((sd$k - 1) %% 2 == 0)),
+      "every-n enumeration reproduces the implemented sample (start = 1)")
+claim(max(fy$identity_err) < 1e-9, "Eq. 2 is an exact identity")
+claim(all(ccor$pearson > 0), "weekly positivity rose with caseload in both sites")
+claim(all(capped$rho < 0), "capped designs have a negative correlation")
+claim(all(capped$rel < 0), "capped designs make the pooled estimate lower")
+claim(all(capped$M > capped$M0), "capped designs are above their thresholds")
+claim(all(fam("every")$M < fam("every")$M0), "every n is below its threshold")
+claim(max(fam("daily")$VIF) < min(fam("weekly")$VIF), "weekly n has the largest VIF")
+claim(all(abs(filter(dec, family == "daily")$D) < 1e-9), "daily n has no unsampled days")
+claim(max(abs(starts$design_bias_pct)) < 1, "every-n design bias is negligible")
+claim(max(starts$ht_max_err) < 1e-9, "Horvitz-Thompson is unbiased under a random start")
+claim(o3s$lo < 1 && o3s$hi > 1, "no within-day arrival-order effect in Sitakunda")
+claim(o3s$p_first < o3s$p_rest, "pooled comparison shows lower positivity in first arrivals")
+claim(site_val(sev, "Sitakunda", "lo") > 0, "severe-only sampling over-estimates in Sitakunda")
+```
+
+
+This technical supplement provides some theoretical results and additional simulations to try to further understand the differences between sampling schemes and analytical approaches. 
+
+# Setup {#sec-setup}
+
+Work within one facility and one calendar year; the catchment estimate is the sum of facility
+estimates. In week $w$ there are $N_w$ suspected cases, of which $m_w$ are tested and $x_w$ are
+RDT-positive. Write $f_w=m_w/N_w$ for the sampling fraction, $\hat p_w=x_w/m_w$ for observed
+positivity and $p_w$ for true positivity among all $N_w$ cases. The target is the annual number of
+RDT-positive cases, $Y=\sum_w N_w p_w$. As in the main text, we simulate within the RDT-tested
+population, so $Y$ is known exactly. The data comprise `r n_fy` facility-years.
+
+The two ways of turning tests into an annual count are
+
+$$
+\hat Y_{\mathrm{weekly}}=\sum_w N_w\,\hat p_w,
+\qquad\qquad
+\hat Y_{\mathrm{pooled}}=N\,\frac{\sum_w x_w}{\sum_w m_w},
+$$ {#eq-estimators}
+
+where $N=\sum_w N_w$. We write $\mathbb{E}_N[a]=\sum_w N_w a_w/N$ for the average of a weekly
+quantity over weeks weighted by suspected cases, and $\mathrm{Cov}_N$ for the corresponding
+covariance.
+
+# Weekly-summed versus pooled annual estimates {#sec-weekly-pooled}
+
+## They differ only in how weeks are weighted
+
+Because $x_w=m_w\hat p_w$, the pooled positivity $\sum_w x_w/\sum_w m_w$ is itself an average of
+the weekly positivities, weighted by tests. Writing $m_w=f_wN_w$ and subtracting the
+suspected-case-weighted average gives
+
+$$
+\hat Y_{\mathrm{pooled}}-\hat Y_{\mathrm{weekly}}
+=N\,\frac{\mathrm{Cov}_N(f,\hat p)}{\mathbb{E}_N[f]}.
+$$ {#eq-diff}
+
+This is an exact identity; across all `r nrow(fy)` strategy–facility-year combinations it
+reproduced the difference between the two estimates to machine precision (largest error
+`r sci(max(fy$identity_err))`). In words, the pooled estimate hands each week more suspected cases
+than it had if that week was sampled above the average fraction, and fewer if below, and values each
+misallocated case at that week's positivity.
+
+## When they agree, and which is biased
+
+- **They agree exactly when $\mathrm{Cov}_N(f,\hat p)=0$**: the sampling fraction is uncorrelated
+  with positivity, weighting weeks by suspected cases. A constant sampling fraction guarantees this
+  whatever the epidemiology; otherwise it depends on the data.
+- **The weekly-summed estimate is unbiased** whenever the cases tested within a week are
+  representative of that week. The pooled estimate needs that *and* a zero covariance between
+  sampling fraction and true positivity.
+- **The sign depends on the design.** Under a cap, the sampling fraction falls as caseload rises.
+  In both sites weekly positivity rose with caseload (correlation
+  `r num(site_val(ccor, "Sitakunda", "pearson"))` in Sitakunda,
+  `r num(site_val(ccor, "Uvira", "pearson"))` in Uvira), so the pooled estimate was too low. A
+  programme that tested *more* intensively during outbreaks would see the opposite.
+
+## What weekly summing costs
+
+Weekly summing gives low-sample weeks full weight, which costs precision. With similar
+within-week variances, the variance ratio is
+
+$$
+\frac{\mathrm{Var}(\hat Y_{\mathrm{weekly}})}{\mathrm{Var}(\hat Y_{\mathrm{pooled}})}
+=\mathbb{E}_N[f]\,\mathbb{E}_N[1/f]\ \ge\ 1,
+$$ {#eq-vif}
+
+with equality only when $f_w$ is constant. We call this the variance inflation factor (VIF). In our
+data it was `r span(fam("every")$VIF)` for every *n*, `r span(fam("daily")$VIF)` for daily *n* and
+`r span(fam("weekly")$VIF)` for weekly *n* (@tbl-evidence).
+
+::: {.callout-note}
+## Three situations
+**Constant sampling fraction:** the two estimates are identical, so there is nothing to choose.
+
+**Sampling fraction varies but is unrelated to positivity** (for example, driven by test stock-outs):
+pooling is unbiased and more precise, so it is better. 
+
+**Sampling fraction varies with positivity**
+(any cap on tests): pooling is biased, weekly summing is unbiased but less precise, and which has the
+smaller error depends on scale.
+:::
+
+## A rule of thumb
+
+Comparing the two errors leads, after two approximations, to a threshold that does not depend on
+how much the sampling fraction varies — only on how strongly it tracks positivity. Pooling has the
+smaller error when the annual number of tests per facility, $M$, is below
+
+$$
+M_0^{*}=\frac{1}{\rho^{2}\kappa},
+$$ {#eq-mstar}
+
+where $\rho$ is the (suspected-case-weighted) correlation between weekly sampling fraction and
+weekly positivity, a property of the design, and $\kappa$ is the between-week variance of positivity
+divided by $\bar p(1-\bar p)$, a property of the epidemiology. $\kappa$ had a median of
+`r num(median(kap_fy$kappa))` across facility-years (facility medians `r span(kap_fac$k)`). Because
+the bias of pooling grows with the square of the programme's size and its precision advantage only
+linearly, every sufficiently large programme should sum weekly estimates. Across the
+`r nrow(fy)` strategy–facility-year combinations, this rule picked the same estimator as an exact
+comparison `r sum(fy$pooled_wins == fy$rule_pooled)` times.
+
+```{r}
+#| label: tbl-mstar
+#| tbl-cap: "Annual tests per facility above which weekly summing has the smaller error."
+rho_grid <- c(0.5, 0.4, 0.3, 0.2, 0.1)
+tab <- as.data.frame(t(c(
+  paste0("$M_0^{*}$ at $\\kappa=", kappa_tab, "$ (tests per facility-year)"),
+  num(1 / (rho_grid^2 * kappa_tab), 0)
+)))
+names(tab) <- c("Correlation $\\rho$ (magnitude)", as.character(rho_grid))
+kable(tab, format = "pipe", align = c("l", rep("r", 5)))
+```
+
+Capped designs had $\rho$ between `r neg(num(min(capped$rho)))` and `r neg(num(max(capped$rho)))`
+and used `r span(capped$M, 0)` tests per facility-year, above their thresholds of
+`r span(capped$M0, 0)`, so weekly summing had the smaller error in `r weekly_wins("daily")` of
+`r n_fy` facility-years under daily *n* and `r weekly_wins("weekly")` under weekly *n*. Every *n* had
+$\rho$ closer to zero (`r neg(num(min(fam("every")$rho)))` to `r neg(num(max(fam("every")$rho)))`)
+and thresholds above its test volume, so pooling was marginally better. That is why the main text
+found no consistent gain from weekly summing for every *n*: the median percent reduction in absolute
+bias was `r neg(num(filter(agg, family == "every", data_source == "Sitakunda")$median_reduction, 1))`%
+in Sitakunda, where weekly summing slightly increased the bias, and
+`r neg(num(filter(agg, family == "every", data_source == "Uvira")$median_reduction, 1))`% in Uvira.
+
+# A general decomposition of error {#sec-decomp}
+
+## One identity
+
+@eq-diff is an instance of a general fact. If a quantity $a$ is averaged over a selected subset of
+units, with selection intensity $g$, instead of over all of them,
+
+$$
+\frac{\sum_j u_j g_j a_j}{\sum_j u_j g_j}-\frac{\sum_j u_j a_j}{\sum_j u_j}
+=\frac{\mathrm{Cov}_u(g,a)}{\mathbb{E}_u[g]},
+$$ {#eq-lemma}
+
+where $u_j$ are the units' weights. The error is zero exactly when selection is uncorrelated with
+the outcome. Applied to weeks it gives @eq-diff; applied to days within a week, or to cases within a
+day, it gives the other error terms below.
+
+## Four sources of error
+
+Because we recommend summing weekly estimates, the error that distinguishes one sampling scheme from
+another is the error of $\hat Y_{\mathrm{weekly}}$. Let $\hat p_w^{\mathrm{day}}$ be the week's
+positivity obtained by weighting each sampled day by its suspected cases, and $p_w^{+}$ the true
+positivity on the days that were sampled. Then, exactly,
+
+$$
+\begin{aligned}
+\hat Y_{\mathrm{weekly}}-Y
+&=\sum_w N_w\Big[\underbrace{\big(\hat p_w-\hat p_w^{\mathrm{day}}\big)}_{\text{B: between-day weighting}}
++\underbrace{\big(\hat p_w^{\mathrm{day}}-p_w^{+}\big)}_{\text{C: within-day selection}}\\
+&\qquad+\underbrace{\big(p_w^{+}-p_w\big)}_{\text{D: unsampled days}}\Big].
+\end{aligned}
+$$ {#eq-four}
+
+The pooled estimate carries one more term, $\mathrm{A}=\hat Y_{\mathrm{pooled}}-\hat Y_{\mathrm{weekly}}$
+from @eq-diff. The terms form a ladder. A is weighting error across weeks, which weekly summing
+removes. B is the same weighting error across the days of a week, which summing daily estimates would
+remove. C and D describe *which* cases were tested, and no re-weighting can remove them.
+
+| Term | Arises when | Removed by |
+|:---------------------------|:------------------------------------------------------------|:---------------------------------|
+| A. Cross-week weighting (pooled estimate only) | The sampling fraction varies across weeks with positivity | Summing weekly estimates |
+| B. Between-day weighting | The sampling fraction varies across days within a week | Summing daily estimates |
+| C. Within-day selection | Which cases are tested on a day relates to positivity | Design only |
+| D. Unsampled days | Some days in a week are never tested | Design only (or coarser periods) |
+| Variance | Few tests in a period | More tests, or spreading them evenly |
+
+: What each error term means and what removes it. {#tbl-terms}
+
+The general principle: **summing estimates at a given time scale removes weighting error at that
+scale and above, but cannot remove selection error — which cases were tested — inside the period.**
+
+# How each sampling scheme generates error {#sec-schemes}
+
+Below, "error" means the error of the weekly-summed estimate, terms B, C and D. Term A matters only
+if a single annual positivity is used.
+
+```{r}
+#| label: tbl-evidence
+#| tbl-cap: "The two sites at a glance. $\\rho$, VIF and the pooled-versus-weekly gap are medians over facility-years. The error column is a single realisation summed over all weeks with at least one test. The last column counts facility-years in which the pooled estimate had the smaller mean squared error."
+#| tbl-colwidths: [16, 9, 8, 13, 34, 20]
+dec_wide <- dec %>%
+  select(strategy, data_source, pct) %>%
+  pivot_wider(names_from = data_source, values_from = pct)
+med %>%
+  left_join(dec_wide, by = "strategy") %>%
+  transmute(
+    Strategy = italic_n(strategy),
+    `$\\rho$` = neg(num(rho)),
+    VIF = num(VIF),
+    `Pooled vs weekly (%)` = neg(num(rel, 1)),
+    `Weekly-summed error, % of truth (Sitakunda / Uvira)` = paste(sgn(Sitakunda), "/", sgn(Uvira)),
+    `Pooled has lower error` = paste(pooled_wins, "of", n_fy)
+  ) %>%
+  kable(format = "pipe", align = c("l", "r", "r", "r", "r", "r"))
+```
+
+**Every *n* (systematic).** Tests are proportional to caseload, so the sampling fraction is nearly
+constant and term A is close to zero; the pooled and weekly-summed estimates barely differ. The
+weakness is quiet weeks: a week with fewer than $n$ cases may get no test at all. In Uvira's quietest
+third of weeks the median number of tests was
+`r num_auto(alloc_val("Every n=2", "Uvira", "quiet_median_tests"))` under $n=2$ and
+`r num_auto(alloc_val("Every n=5", "Uvira", "quiet_median_tests"))` under $n=5$, and
+`r pct(alloc_val("Every n=5", "Uvira", "quiet_pct_empty"))` of those weeks went untested under $n=5$
+(@tbl-alloc). The every-*n* errors in @tbl-evidence reflect which cases the fixed starting point
+happened to select, not systematic bias: averaged over all possible starting points the bias was at
+most `r pct(max(abs(starts$design_bias_pct)), 2)` of the truth.
+
+**First *n* per day (daily *n*).** The cap lowers the sampling fraction on busy days, so term A is
+present ($\rho$ between `r neg(num(min(fam("daily")$rho)))` and `r neg(num(max(fam("daily")$rho)))`)
+but weekly summing removes it. Term B, the same effect between days of a week, was small (about
+`r num(mean(abs(dec_d3$B)), 0)` cases for $n=3$). Term D is zero, because every day with a case
+contributes at least one test, so no week with cases goes untested. Term C is the only open
+question: whether the first arrivals of the day differ from later ones. It is zero on days with $n$
+or fewer cases and shrinks as $n$ grows. In Sitakunda, the one site with arrival times, there was no
+evidence of such a difference within facility-days (Mantel–Haenszel odds ratio for the first three
+arrivals `r num(o3s$or)`, 95% CI `r num(o3s$lo)`–`r num(o3s$hi)`). A comparison pooled across days
+appears to show one (`r num(o3s$p_first, 1)`% vs `r num(o3s$p_rest, 1)`% positive), but that is
+term-A-style confounding one level down: only busy, high-positivity days contribute "later" arrivals.
+Weekly-summed errors were within ±`r pct(max(abs(filter(dec, family == "daily", size >= 2)$pct)), 1)`
+of the truth for $n\ge2$.
+
+**First *n* per week from a random start day (weekly *n*).** The cap is as tight as it can be — at
+most $n$ tests in a week — so term A and the VIF are the largest of any scheme. The tests fall on one
+or two consecutive days, so terms C and D are large, and positivity clusters within days, which adds
+variance. The random start day removes day-of-week effects only in busy weeks; in quiet weeks the
+scheme tests every case from the start day to the end of the week, so later weekdays are
+over-represented. Under $n=3$, `r pct(alloc_val("Weekly n=3", "Uvira", "quiet_pct_empty"))` of
+Uvira's quietest weeks went untested.
+
+**All cases on one random day per week.** Every case has a one-in-seven chance of being tested, so
+seven times the positives on the chosen day is an unbiased weekly count. The weekly positivity
+estimate is not: it gives every weekday equal weight rather than weight by caseload, so it is biased
+whenever busy weekdays differ in positivity (term D). Testing a single day also makes it very
+variable.
+
+**All cases on a fixed weekday.** The error is entirely term D and does not average out. Positivity
+ranged by weekday from `r day_min(dow_s)` to `r day_max(dow_s)` in Sitakunda and from
+`r day_min(dow_u)` to `r day_max(dow_u)` in Uvira. The other days are never seen, so nothing in the
+data can correct it.
+
+**Severe cases only.** Selection depends on the outcome itself: cholera causes severe dehydration,
+so severe cases are more often positive. This is term C at its worst, and no analysis can remove it
+without separate information on non-severe cases. It over-estimated annual incidence in Sitakunda by
+`r num(site_val(sev, "Sitakunda", "lo"))`–`r num(site_val(sev, "Sitakunda", "hi"), 1)` per 10,000.
+
+| Scheme | A: across weeks (if pooled) | B: across days | C: within a day | D: unsampled days | Fixable in analysis |
+|:---------------|:----------------|:---------------|:-------------------|:-----------------------|:----------------------|
+| Every *n* | Near zero | Small | Small | Frequent when weeks are quiet | Little to fix |
+| Daily *n* | Yes | Small | Arrival order, if any | None | A and B |
+| Weekly *n* | Largest | Yes | Arrival order, if any | Large; weekday imbalance | A only |
+| Random day | Yes | None | None | Weekday caseload differences | Use 7 × positives |
+| Fixed weekday | Yes | None | None | Persistent day effect | No |
+| Severe only | Yes | Yes | Outcome-driven | Some | No |
+
+: Which error terms each scheme produces. {#tbl-schemes}
+
+# Why the daily cap works at both time scales {#sec-why}
+
+**Annual burden** is estimated most precisely when tests are proportional to caseload, which is what
+every *n* does. Under proportional allocation the two estimators coincide and there is no weighting
+error.
+
+**Weekly trends and outbreak detection** need adequate precision in *every* week, including quiet ones.
+The precision of weekly positivity depends on the number of tests that week, not on the caseload:
+its standard error is roughly $\sqrt{p(1-p)/m_w}$.
+
+```{r}
+#| label: tbl-se
+#| tbl-cap: "Approximate standard error of weekly positivity. These ignore the finite-population correction, so they overstate the error when most of a week's cases are tested."
+m_grid <- c(3, 5, 10, 20, 30)
+se_tab <- data.frame(
+  row = c("SE at positivity 20%", "SE at positivity 50%"),
+  rbind(num(sqrt(0.2 * 0.8 / m_grid)), num(sqrt(0.5 * 0.5 / m_grid)))
+)
+names(se_tab) <- c("Tests in the week, $m_w$", m_grid)
+kable(se_tab, format = "pipe", align = c("l", rep("r", 5)))
+```
+
+For this target, the best use of a fixed budget is a similar number of tests every week, and
+proportional allocation is the worst case, because quiet weeks get almost none. A cap on tests per
+day approximates equal allocation:
+
+```{r}
+#| label: tbl-alloc
+#| tbl-cap: !expr paste0("Tests in the busiest versus quietest third of weeks. Peak weeks had ", num(site_val(distinct(alloc, data_source, caseload_ratio), 'Sitakunda', 'caseload_ratio'), 1), " times the caseload of quiet weeks in Sitakunda and ", num(site_val(distinct(alloc, data_source, caseload_ratio), 'Uvira', 'caseload_ratio'), 1), " times in Uvira; proportional allocation would match those ratios. Where the quiet-week median is zero, the ratio uses 0.5 in its place.")
+#| tbl-colwidths: [18, 14, 22, 22, 24]
+alloc %>%
+  arrange(match(strategy, note_strategies$label), data_source) %>%
+  transmute(
+    Strategy = italic_n(strategy),
+    Site = data_source,
+    `Tests, peak vs quiet weeks` = num(test_ratio, 1),
+    `Median tests, quiet week` = num_auto(quiet_median_tests),
+    `Quiet weeks with no test` = pct(quiet_pct_empty)
+  ) %>%
+  kable(format = "pipe", align = c("l", "l", "r", "r", "r"))
+```
+
+The cap's cost at the annual scale is term A, which weekly summing removes at no cost in tests, plus
+a VIF that is small for daily *n* (`r span(fam("daily")$VIF)`). Every *n* makes the opposite choice:
+ideal for annual totals, but it starves quiet weeks. Weekly *n* makes the same choice as daily *n* at
+far too low a level of testing: it pays the same cost but buys too few tests to benefit.
+
+# Heuristics {#sec-heuristics}
+
+| Goal | Scheme | Annual estimator | Why |
+|:----------------------|:--------------------------|:---------------------|:----------------------------------------------------|
+| Annual burden, adequate caseload | Every *n* or daily *n* | Either for every *n*; weekly sums for daily *n* | Every *n* needs no correction; daily *n*'s weighting error is removed by weekly sums |
+| Weekly trends and outbreak detection | Daily *n*, $n\ge3$ | Weekly sums | Tests every week with cases, with low weekly error |
+| Low or seasonal incidence | Daily *n* | Weekly sums; coarsen to fortnights or months if many weeks are thin | Every *n* with large *n* leaves quiet weeks untested |
+| Very limited test supply | Daily *n* with small *n* | Weekly sums | Keeps tests spread across days and weeks; daily $n=1$ still gave weekly 95% CI coverage of `r span(cov_d1$coverage, 0)`% |
+
+: Choosing a scheme and estimator, based on the theory above and the two study sites. {#tbl-heuristics}
+
+1. **Match the estimator to the design.** Any cap on tests per day or week calls for summing weekly
+   (or finer) estimates. Pooling one annual positivity is reasonable only under a self-weighting
+   design such as every *n*, or when annual test volume is below $M_0^{*}=1/(\rho^2\kappa)$.
+2. **Budget tests for the quietest weeks you care about.** Use @tbl-se to decide how many tests a week
+   you need. Under every *n* a week gets about $N_w/n$ tests, so $n$ should not exceed the quiet-week
+   caseload divided by that number. Under daily *n* a week gets at least one test per day with cases.
+3. **Cap per day, not per week.** A daily cap spreads tests across days, never leaves a week with
+   cases untested, and avoids the weekday imbalance of weekly caps.
+4. **Never select on something related to the outcome.** Severity-based or fixed-weekday sampling
+   produces error that no analysis can correct.
+5. **Summarise at the finest period the data support.** Summing weekly estimates removes weighting
+   error; where many weeks have no tests, move to fortnights or months rather than filling gaps by
+   imputation.
+6. **Check the two assumptions the recommended schemes rely on.** Test for differences between early
+   and late arrivals *within* facility-days, never pooled across days, and record weekly
+   suspected-case counts carefully, since weekly summing uses them as weights.
+
+# Caveats {#sec-caveats}
+
+- The evidence comes from two endemic sites and `r n_fy` facility-years.
+- The precision results assume the cases tested within a week are representative of that week, and
+  ignore clustering of positivity within facility-days (latent-scale intraclass correlation
+  `r num(site_val(icc, "Sitakunda", "icc"), 3)` in Sitakunda and `r num(site_val(icc, "Uvira", "icc"), 3)`
+  in Uvira), which makes schemes that test one or two days per week less precise than shown.
+- Weeks with no tested case are excluded from these calculations; the main analysis imputes them.
+- Arrival order could be examined only in Sitakunda; Uvira has no within-day arrival times.
+- As in the main text, RDT misclassification is ignored.

@@ -1,0 +1,18 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+
+# Regenerated outputs
+data/case_data_delta.csv
+data/budget_matched/replicates.csv.gz
+data/budget_matched/*.png
+data/budget_matched/*.pdf
+figures/*
+!figures/.gitkeep
+tables/*
+!tables/.gitkeep
+notebooks/*.html
+notebooks/*.pdf
+notebooks/*_files/

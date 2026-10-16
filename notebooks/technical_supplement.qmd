@@ -1,0 +1,420 @@
+---
+title: "Technical supplement: sampling design, aggregation and estimation error"
+subtitle: "Supplement to *Cholera Surveillance with Rapid Diagnostic Tests*"
+date: today
+format:
+  typst:
+    papersize: us-letter
+    margin:
+      x: 1in
+      y: 1in
+    fontsize: 10.5pt
+    section-numbering: "1.1"
+    fig-format: png
+execute:
+  echo: false
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    dev: "ragg_png"
+    dpi: 300
+crossref:
+  eq-prefix: "Eq."
+# Keep RStudio in source mode: the visual editor moves {#eq-...} labels off the
+# closing $$ line on save, which silently breaks equation cross-references.
+editor: source
+---
+
+<!--
+Render from the repository root:
+    quarto render notebooks/technical_supplement.qmd
+Inputs: data/sampled_data.csv, data/clinical_data.csv, data/budget_matched/summary.csv
+        (produced by scripts/budget_matched_comparison.R) and data/budget_matched/by_caseload.csv
+        (produced by scripts/budget_matched_by_caseload.R)
+Functions: scripts/sampling_theory_funcs.R, scripts/supplement_funcs.R
+All numbers are computed at render time.
+-->
+
+```{r}
+#| label: setup
+library(dplyr)
+library(tidyr)
+library(readr)
+library(knitr)
+library(ggplot2)
+invisible(Sys.setlocale("LC_CTYPE", "en_US.UTF-8"))
+source(here::here("scripts/sampling_theory_funcs.R"))
+source(here::here("scripts/supplement_funcs.R"))
+
+sd <- load_tested(here::here("data/sampled_data.csv"))
+clin <- read_csv(here::here("data/clinical_data.csv"), show_col_types = FALSE)
+bm <- read_csv(here::here("data/budget_matched/summary.csv"), show_col_types = FALSE)
+bm_band <- read_csv(here::here("data/budget_matched/by_caseload.csv"), show_col_types = FALSE)
+bm_reps <- read_lines(here::here("data/budget_matched/run_info.txt"), n_max = 1) %>% readr::parse_number()
+
+# some helpers 
+minus <- function(s) gsub("-", "\u2212", s, fixed = TRUE)
+num <- function(x, d = 1) minus(formatC(round(x, d) + 0, format = "f", digits = d, big.mark = ","))
+sgn <- function(x, d = 1) paste0("$", sprintf(paste0("%+.", d, "f"), x), "$")
+rng <- function(x, d = 2) paste0(num(min(x), d), " to ", num(max(x), d))
+ci <- function(o, l, h) paste0(num(o, 2), " (", num(l, 2), ", ", num(h, 2), ")")
+dash <- "\u2013"
+italic_n <- function(s) sub(" n=", " *n*=", s, fixed = TRUE)
+site_cols <- c(Sitakunda = "#0072B2", Uvira = "#D55E00")
+theme_set(theme_minimal(base_size = 10) +
+            theme(panel.grid.minor = element_blank(), strip.text = element_text(face = "bold")))
+```
+
+```{r}
+#| label: compute
+fy <- fy_diagnostics(sd, supp_strategies)
+n_fy <- nrow(distinct(fy, data_source, site, year))
+cl <- caseload_positivity_fy(sd)
+obs <- observed_testing_fy(filter(clin, data_source == "Uvira"))
+dec <- error_decomposition(sd, supp_strategies)
+stopifnot(max(abs(with(dec, A + B + C + D + E - pooled_error))) < 1e-8)
+
+ranked <- rank_arrivals(sd)
+first_pos <- bind_rows(first_n_comparison(ranked, "day", c(1, 2, 3, 5)),
+                       first_n_comparison(ranked, "week", c(1, 3, 5, 10)))
+first_cov <- bind_rows(
+  first_n_comparison(ranked, "day", 3, "under5"),
+  first_n_comparison(ranked, "day", 3, "sample_severe_cases"),
+  first_n_comparison(ranked, "week", 3, "under5"),
+  first_n_comparison(ranked, "week", 3, "sample_severe_cases")
+)
+fp <- function(src, u, k, col) first_pos[[col]][first_pos$data_source == src & first_pos$unit == u & first_pos$first_n == k]
+
+big_daily <- filter(fy, family == "daily", site %in% c("BITID", "ctc"))
+stopifnot(!any(big_daily$pooled_wins))
+
+bmv <- function(src, scheme, est, metric, cap = 3) {
+  z <- bm[[metric]][bm$data_source == src & bm$scheme == scheme & bm$estimator == est & bm$daily_cap == cap]
+  stopifnot(length(z) == 1)
+  z
+}
+```
+
+# Scope and notation
+
+This supplement collects the technical results behind the main text's comments on sampling design. It covers (i) why annual estimates formed by pooling tests differ from those formed by summing weekly estimates, (ii) how the fraction of cases tested relates to positivity in the two sites, (iii) where the error that remains after summing weekly estimates comes from, (iv) whether the first cases seen each day or week look different from later cases, and (v) a comparison of allocation strategies holding the number of tests fixed. As in the main text, the reference population is the set of suspected cholera cases with a recorded RDT result attending the facilities under surveillance, so the true number of RDT-positive cases is known. In this supplement, we say *error* for the difference between one realised estimate and this reference, and reserve *bias* for an average over repeated samples. In the main text we refer to both as bias for simplicity.
+
+The main text draws on this supplement at four points: the exact relationship between pooled and weekly-summed annual estimates and the variance cost of weekly summing (@sec-identity and @sec-rho); the size of the error introduced by day-to-day variation in the sampling fraction (@sec-decomp, term B); whether the first cases seen each day or week differ from later cases (@sec-first); and the comparison of sampling strategies at equal numbers of tests (@sec-budget).
+
+First we start with a simple situation of one facility and one year. In week $w$ there are $N_w$ suspected cases, of which $m_w$ are tested and $x_w$ are positive. Let $f_w = m_w/N_w$ be the sampling fraction, $\hat p_w = x_w/m_w$ the observed positivity and $p_w$ the positivity among all $N_w$ cases. The target is $Y = \sum_w N_w p_w$, with $N = \sum_w N_w$. The two annual estimators are
+
+$$
+\hat Y_{\text{weekly}} = \sum_w N_w \hat p_w,
+\qquad
+\hat Y_{\text{pooled}} = N\,\frac{\sum_w x_w}{\sum_w m_w}.
+$$ {#eq-estimators}
+
+For any weekly quantity $a_w$ write $\mathbb{E}_N[a] = \sum_w N_w a_w / N$ for its case-weighted mean over weeks, and $\operatorname{Cov}_N$ for the corresponding covariance. Unless stated otherwise, weeks without a test are ignored; @sec-decomp counts the positives they contain separately.
+
+# Pooled versus weekly-summed annual estimates {#sec-identity}
+
+**Result 1 (identity).** For any sample in which every week has at least one test,
+
+$$
+\hat Y_{\text{pooled}} - \hat Y_{\text{weekly}} = N\,\frac{\operatorname{Cov}_N(f, \hat p)}{\mathbb{E}_N[f]}.
+$$ {#eq-identity}
+
+*Proof.* Since $x_w = m_w \hat p_w$ and $m_w = N_w f_w$,
+$$
+\frac{\sum_w x_w}{\sum_w m_w} = \frac{\sum_w N_w f_w \hat p_w}{\sum_w N_w f_w} = \frac{\mathbb{E}_N[f\hat p]}{\mathbb{E}_N[f]} = \mathbb{E}_N[\hat p] + \frac{\operatorname{Cov}_N(f,\hat p)}{\mathbb{E}_N[f]},
+$$
+using $\mathbb{E}_N[f\hat p] = \mathbb{E}_N[f]\,\mathbb{E}_N[\hat p] + \operatorname{Cov}_N(f,\hat p)$. Multiplying by $N$ and noting $N\,\mathbb{E}_N[\hat p] = \hat Y_{\text{weekly}}$ gives @eq-identity. $\square$
+
+Both estimators are averages of the same weekly positivities; pooling weights weeks by tests and weekly summing weights them by suspected cases. The two agree when the sampling fraction is constant, or more generally when it is uncorrelated with observed positivity across weeks. In our data the identity held to within $10^{`r ceiling(log10(max(fy$identity_err)))`}$ cases in every facility-year and strategy.
+
+**Result 2 (bias).** Suppose the weekly numbers of tests $m_w \ge 1$ are fixed by the design, and within each week the tested cases are a simple random sample, so that $\mathbb{E}[\hat p_w] = p_w$. Then $\hat Y_{\text{weekly}}$ is unbiased, and because $\hat Y_{\text{pooled}}$ is linear in the $\hat p_w$ when the $m_w$ are fixed,
+
+$$
+\mathbb{E}[\hat Y_{\text{pooled}}] - Y = N\,\frac{\operatorname{Cov}_N(f, p)}{\mathbb{E}_N[f]}.
+$$ {#eq-bias}
+
+*Proof.* $\mathbb{E}[\hat Y_{\text{weekly}}] = \sum_w N_w p_w = Y$. For the pooled estimator, $\mathbb{E}[\sum_w m_w\hat p_w]/\sum_w m_w = \sum_w m_w p_w / \sum_w m_w$, and the argument of Result 1 with $p_w$ in place of $\hat p_w$ gives @eq-bias. $\square$
+
+The result is conditional on the weekly numbers of tests. Under every-$n$ sampling the $m_w$ depend on the random start, but conditioning on their realised values @eq-bias applies unchanged with $f_w = m_w/N_w$. In addition, the assumption that tested cases are representative within each week is not guaranteed by rules such as testing the first $n$ arrivals; @sec-decomp and @sec-first examine that part of the error.
+
+Summing weekly estimates can come with a cost to variance. Under the same assumptions and with similar within-week variances, the ratio of the variance of $\hat Y_{\text{weekly}}$ to that of $\hat Y_{\text{pooled}}$ is approximately $\mathbb{E}_N[f]\,\mathbb{E}_N[1/f] \ge 1$, which equals one when $f_w$ is constant. Across strategies and facility-years in our data this ratio was `r rng(fy$VIF)`, with the largest values for weekly caps (@tbl-rho).
+
+The bias of pooling is a fixed share of the caseload, while the extra variance of weekly summing shrinks with the number of tests, so at realistic testing volumes the bias dominates. Under daily caps in the two large facilities, weekly summing had the lower approximate root mean squared error in every facility-year. We therefore sum weekly estimates throughout.
+
+# Sampling fraction and positivity {#sec-rho}
+
+@eq-bias illustrates that what matters for pooling is the correlation between the weekly sampling fraction and positivity. Under a cap on tests per day or week (e.g., daily n, weekly n), the sampling fraction falls as caseload (usually a result of real cholera) rises, so this correlation reflects how positivity moves with caseload.
+
+**Caseload and positivity.** Across the `r n_fy` facility-years, the Spearman correlation between weekly caseload and weekly positivity ranged from `r rng(cl$r_caseload)` (median `r num(median(cl$r_caseload), 2)`). It was consistently positive in the Uvira treatment centre (`r rng(filter(cl, data_source == "Uvira", site == "ctc")$r_caseload)`) and at the larger Sitakunda facility (BITID), and close to zero at the smaller facilities with few cases.
+
+**Sampling fraction under each strategy.** @tbl-rho and @fig-rho summarise $\rho = \operatorname{Cor}_N(f, p)$ for each strategy. Every-$n$ sampling tests close to a fixed fraction of cases, so at $n=2$ $\rho$ was near zero and the two annual estimators differed little. At larger $n$ quiet weeks receive zero or one test (a week with three cases under $n=10$), so among weeks with a test the sampling fraction is higher in quiet weeks than in busy ones; this produced moderate negative correlations in Uvira (median `r num(median(filter(fy, data_source == "Uvira", strategy == "Every n=10")$rho), 2)` at $n=10$), which has many quiet weeks. Daily and weekly caps produced negative correlations in most facility-years, and pooled estimates were below weekly-summed ones for most strategies. The exception was Sitakunda under one test per week, where each week's observed positivity is a single 0/1 outcome and $\rho$, defined on true positivity, does not predict the realised difference.
+
+```{r}
+#| label: tbl-rho
+#| tbl-colwidths: [14, 16, 24, 28, 18]
+#| tbl-cap: "Correlation between weekly sampling fraction and true weekly positivity ($\\rho$, case-weighted), the relative difference between pooled and weekly-summed annual estimates, and the approximate variance ratio (>1 meaning more variance with weekly). Medians (range) over facility-years are shown in cells."
+fy %>%
+  group_by(data_source, strategy) %>%
+  summarise(
+    rho_txt = paste0(num(median(rho), 2), " (", num(min(rho), 2), ", ", num(max(rho), 2), ")"),
+    rel_txt = paste0(num(100 * median(rel_diff), 1), " (", num(100 * min(rel_diff), 1), ", ", num(100 * max(rel_diff), 1), ")"),
+    vif = num(median(VIF), 2), .groups = "drop"
+  ) %>%
+  arrange(data_source, match(strategy, supp_strategies$label)) %>%
+  transmute(Site = data_source, Strategy = italic_n(strategy),
+            `$\\rho$` = rho_txt, `Pooled vs weekly (%)` = rel_txt, `Variance ratio` = vif) %>%
+  kable(format = "pipe", align = c("l", "l", "r", "r", "r"))
+```
+
+```{r}
+#| label: fig-rho
+#| fig-cap: "Correlation between the weekly sampling fraction and true weekly positivity for each strategy. Each point is one facility-year with different symbols for large and small facilities."
+#| fig-width: 7
+#| fig-height: 3.2
+fy %>%
+  mutate(strategy = factor(strategy, levels = rev(supp_strategies$label)),
+         `facility type`=case_when(site %in% c("Sitakunda Upazila Health Complex","ctu") ~ "small facility",
+                                 site %in% c("BITID","ctc") ~ "large facility",
+                                 TRUE ~ NA)) %>%
+  ggplot(aes(rho, strategy, colour = data_source)) +
+  geom_vline(xintercept = 0, colour = "grey60", linetype = "dashed") +
+  geom_point(aes(pch=`facility type`),position = position_jitter(height = 0.15, seed = 1), alpha = 0.8, size = 1.8) +
+  facet_wrap(~data_source) +
+  scale_colour_manual(values = site_cols, guide = "none") +
+  labs(x = expression(rho == Cor[N](f, p)), y = NULL)
+```
+
+**Routine testing in Uvira.** In the routine Uvira data, `r num(100 - 100 * sum(obs$tested_pct * obs$suspected / 100) / sum(obs$suspected), 0)`% of suspected cases had no RDT result, so the same identity applies to annual estimates built from the tested cases. In the treatment centre the case-weighted correlation between the weekly fraction tested and weekly positivity was small in every year (`r rng(filter(obs, site == "ctc")$r_fp)`), so pooling and weekly summing would give similar annual estimates there.
+
+# Sources of error in the weekly-summed estimate {#sec-decomp}
+
+The main text recommends summing weekly estimates, which removes the weighting term of @eq-identity. This section asks where the error that remains comes from, and which design choice would remove each part. @eq-identity is one case of a general weighting identity: averaging a quantity over a selected subset of units with selection intensity $g$ differs from averaging over all units by $\operatorname{Cov}(g, a)/\mathbb{E}[g]$. Applying it at successive time scales splits the realised error into parts that can be attributed to the estimator and parts that can only be attributed to the design.
+
+For day $d$ let $N_d$, $m_d$, $x_d$ and $t_d$ be the numbers of suspected, tested, RDT-positive tested and RDT-positive suspected cases, with $\hat p_d = x_d/m_d$ and $p_d = t_d/N_d$. For a week $w$ with tests, let $S_w$ be the days of that week with at least one test, and define
+
+$$
+\hat p^{\text{day}}_w = \frac{\sum_{d \in S_w} N_d \hat p_d}{\sum_{d \in S_w} N_d},
+\qquad
+p^+_w = \frac{\sum_{d \in S_w} N_d p_d}{\sum_{d \in S_w} N_d},
+$$ {#eq-dayterms}
+
+the case-weighted mean of the daily observed positivities over the sampled days, and the true positivity among all cases, tested or not, on those days. Then, exactly,
+
+$$
+\hat Y_{\text{weekly}} - Y =
+\sum_{w:\,m_w>0} N_w \Big[\underbrace{(\hat p_w - \hat p^{\text{day}}_w)}_{B}
++ \underbrace{(\hat p^{\text{day}}_w - p^+_w)}_{C}
++ \underbrace{(p^+_w - p_w)}_{D}\Big]
+\underbrace{- \sum_{w:\,m_w=0} N_w p_w}_{E},
+$$ {#eq-decomp}
+
+and the pooled estimate adds the term of @eq-identity, $A = \hat Y_{\text{pooled}} - \hat Y_{\text{weekly}}$, so that $\hat Y_{\text{pooled}} - Y = A + B + C + D + E$. A is covered by @sec-identity and @sec-rho and is not considered further here.
+
+*Proof.* $\hat Y_{\text{weekly}}$ sums only over weeks with a test, so splitting $Y$ into weeks with and without a test gives $\hat Y_{\text{weekly}} - Y = \sum_{w:\,m_w>0} N_w(\hat p_w - p_w) - \sum_{w:\,m_w=0} N_w p_w$. Adding and subtracting $\hat p^{\text{day}}_w$ and $p^+_w$ inside the first sum gives @eq-decomp. $\square$
+
+The terms B, C and D have simpler forms. For B, $m_d = N_d f_d$ gives $\hat p_w = \sum_{d \in S_w} N_d f_d \hat p_d / \sum_{d \in S_w} N_d f_d$, and the argument of Result 1 applies with days in place of weeks. For C, $\hat p^{\text{day}}_w$ and $p^+_w$ weight the same days by the same $N_d$, so $\hat p^{\text{day}}_w - p^+_w = \sum_{d \in S_w} N_d(\hat p_d - p_d) / \sum_{d \in S_w} N_d$, a case-weighted mean of the daily sampling errors. For D, write $\phi_w$ for the share of week $w$'s cases that fall on sampled days and $p^-_w$ for positivity among cases on the other days. Then $p_w = \phi_w p^+_w + (1-\phi_w)p^-_w$, so $p^+_w - p_w = (1-\phi_w)(p^+_w - p^-_w)$, which is zero when $\phi_w = 1$.
+
+- **B, weighting across days within a week.** The weekly positivity $\hat p_w = x_w/m_w$ pools all tests in the week, so each sampled day counts in proportion to its number of tests. In $\hat p^{\text{day}}_w$ each day instead counts in proportion to its number of cases, and B is the difference between the two. It is the weighting term of @eq-identity applied to the sampled days of one week instead of the weeks of a year: $\hat p_w - \hat p^{\text{day}}_w = \operatorname{Cov}_{S_w}(f_d, \hat p_d)/\mathbb{E}_{S_w}[f_d]$, with days weighted by $N_d$. B is non-zero only when the sampling fraction differs between the sampled days of a week, as it does under a daily cap when caseload changes from day to day. It is zero when all of a week's tests fall on one day, and summing daily rather than weekly estimates would remove it.
+- **C, within-day sampling error.** On the sampled days, the difference between positivity among tested cases and among all cases. It contains selection (cases tested on a day differing from those not tested on characteristics associated with positivity) and chance (which cases happen to be tested). Re-weighting by time period does not remove it. In one realisation the two cannot be separated, so @tbl-decomp also reports the standard deviation that C would have by chance alone if the tested cases on each day were a simple random sample of that day's cases, holding fixed which days were sampled and how many tests each received; @sec-first tests for selection directly.
+- **D, days not sampled.** The difference between true positivity on the sampled days and in the whole week, $(1-\phi_w)(p^+_w - p^-_w)$. It is large only when many of the week's cases fall on unsampled days and those days differ in positivity from the sampled ones. It involves no test results, so under a first-$n$ rule, where the data fix which days are sampled, it is not a chance quantity. It is zero when every day with a case has a test, and can only be reduced by spreading tests across more days.
+- **E, weeks not sampled.** Positives in weeks with no test, omitted here; the main analysis imputes these weeks instead.
+
+B is a property of the estimator and is removed by summing over shorter periods; C, D and E are properties of the design and can only be reduced by changing which cases are tested, or by imputation. The terms describe one realisation. They can offset one another, both within a facility-year and when summed across facility-years, and a term that is non-zero in one sample need not indicate systematic bias.
+
+```{r}
+#| label: tbl-decomp
+#| tbl-colwidths: [14, 16, 10, 10, 10, 10, 10, 20]
+#| tbl-cap: "Decomposition of the realised annual error of the weekly-summed estimate (@eq-decomp), summed over facility-years within each site and expressed as a percentage of the true number of RDT-positive cases. Signed errors from different facility-years can offset. SD(C) is the standard deviation C would have by chance alone under within-day simple random sampling. The total here omits untested weeks (term E) and so differs from the weekly-summed bias in the main text, which imputes them."
+dec %>%
+  group_by(data_source, strategy) %>%
+  summarise(truth = sum(truth), across(c(B, C, D, E, weekly_error), sum),
+            sd_C = sqrt(sum(var_C)), .groups = "drop") %>%
+  mutate(across(c(B:weekly_error, sd_C), ~ num(100 * .x / truth, 1))) %>%
+  arrange(data_source, match(strategy, supp_strategies$label)) %>%
+  transmute(Site = data_source, Strategy = italic_n(strategy),
+            B, C, `SD(C)` = sd_C, D, E, `Total (B to E)` = weekly_error) %>%
+  kable(format = "pipe", align = c("l", "l", rep("r", 6)))
+```
+
+```{r}
+#| label: decomp-values
+dsum <- dec %>% group_by(data_source, family, strategy) %>%
+  summarise(truth = sum(truth), across(A:weekly_error, sum), sd_C = sqrt(sum(var_C)), .groups = "drop") %>%
+  mutate(across(c(A:weekly_error, sd_C), ~ 100 * .x / truth))
+dfam <- function(f, col) dsum[[col]][dsum$family == f]
+dfy <- dec %>% mutate(across(A:weekly_error, ~ 100 * .x / truth), big = site %in% c("BITID", "ctc"))
+dfyfam <- function(f, col) dfy[[col]][dfy$family == f]
+z_C_max <- max(abs(dsum$C / dsum$sd_C))
+small_truth <- rng(dfy$truth[!dfy$big], 0)
+```
+
+```{r}
+#| label: fig-decomp
+#| fig-cap: "Terms B to E of @eq-decomp for each facility-year and strategy, as a percentage of that facility-year's true number of RDT-positive cases, against the share of the facility-year's cases tested. Vertical bars on C show plus or minus one standard deviation under within-day simple random sampling (chance alone). Symbols distinguish large and small facilities, and point size is proportional to the true count; the two small facilities (Sitakunda Upazila Health Complex and the Uvira CTU) have few positives per year and account for the extreme values."
+#| fig-width: 7.5
+#| fig-height: 6.5
+fam_cols <- c(every = "#009E73", daily = "#0072B2", weekly = "#D55E00")
+fam_labs <- c(every = "Every n", daily = "Daily n", weekly = "Weekly n")
+dec %>%
+  inner_join(select(fy, data_source, site, year, strategy, M, N_year),
+             by = c("data_source", "site", "year", "strategy")) %>%
+  mutate(sf = 100 * M / N_year, sd_C = 100 * sqrt(var_C) / truth) %>%
+  pivot_longer(B:E, names_to = "term") %>%
+  mutate(pct = 100 * value / truth,
+         lo = ifelse(term == "C", pct - sd_C, NA), hi = ifelse(term == "C", pct + sd_C, NA),
+         family = factor(family, names(fam_labs), fam_labs),
+         `facility type` = case_when(site %in% c("Sitakunda Upazila Health Complex", "ctu") ~ "small facility",
+                                     site %in% c("BITID", "ctc") ~ "large facility",
+                                     TRUE ~ NA)) %>%
+  ggplot(aes(sf, pct, colour = family)) +
+  geom_hline(yintercept = 0, colour = "grey60", linetype = "dashed") +
+  geom_linerange(aes(ymin = lo, ymax = hi), alpha = 0.35, linewidth = 0.4, na.rm = TRUE, show.legend = FALSE) +
+  geom_point(aes(size = truth, pch = `facility type`), alpha = 0.75) +
+  facet_grid(term ~ data_source, scales = "free_y") +
+  scale_colour_manual(values = unname(fam_cols), name = NULL) +
+  scale_shape_discrete(name = NULL) +
+  guides(colour = guide_legend(override.aes = list(size = 2.5)),
+         shape = guide_legend(override.aes = list(size = 2.5))) +
+  scale_size_area(max_size = 3, guide = "none") +
+  labs(x = "Cases tested in the facility-year (%)", y = "Error (% of true RDT-positive cases)") +
+  theme(legend.position = "bottom")
+```
+
+@tbl-decomp and @fig-decomp show the following.
+
+- **B was small.** Summed within site it was `r rng(dsum$B, 1)`% of the truth under every strategy, so summing daily rather than weekly estimates would gain little.
+- **C was consistent with chance.** Summed within site, C never exceeded `r num(z_C_max, 1)` chance standard deviations. This comparison has little power to detect selection, particularly when there are few tests per day (under one test per week the chance SD reached `r num(max(filter(dsum, strategy == "Weekly n=1")$sd_C), 1)`%); the direct test for selection is in @sec-first.
+- **D and E depend on the design, not the estimator.** Both are zero under daily caps, because every day with a case receives a test. Under weekly caps each week's tests fall on one or two days, and D ranged from `r rng(dfyfam("weekly", "D"), 1)`% across facility-years, including at testing fractions where daily caps had D of zero (@fig-decomp). E arose under sparse every-$n$ sampling and in the small facilities (`r small_truth` positives per year), where quiet weeks went untested; the main analysis imputes these weeks, and E here shows how much can rest on that imputation (up to `r num(max(abs(dfy$E)), 0)`% in a single small facility-year).
+
+After summing weekly estimates, then, the remaining error under daily caps was consistent with chance. Under weekly caps and sparse every-$n$ sampling it also came from days and weeks with no test, which no re-weighting of the tests in hand can correct; only spreading tests across more days, or imputation, can address it.
+
+# Do the first cases differ from later cases? {#sec-first}
+
+Rules that test the first $n$ cases in a day or week rely on these cases resembling the others in the same period (the selection part of term C, and D for weekly caps). We ranked cases within each facility-day and facility-week by recorded order: the record timestamp in Sitakunda and the record sequence in Uvira, where times of day were not recorded but the record sequence is likely close to the arrival order.
+
+Each comparison is restricted to days (or weeks) with more than $n$ cases, so that both groups are observed in the same periods. We compare the two groups with a Mantel–Haenszel odds ratio stratified by facility-day or facility-week, since a crude comparison is confounded by period: only busy days contribute later cases, and busy days tend to have higher positivity. Confidence intervals are not adjusted for multiple comparisons.
+
+```{r}
+#| label: fig-first
+#| fig-cap: "Stratified (Mantel–Haenszel) odds ratios for RDT positivity among the first $n$ versus later cases in the same facility-day or facility-week, with 95% confidence intervals. OR > 1 means higher positivity among the first $n$."
+#| fig-width: 5
+#| fig-height: 3.4
+first_pos %>%
+  mutate(lab = factor(paste0(ifelse(unit == "day", "Day", "Week"), ", n=", first_n),
+                      levels = rev(c(paste0("Day, n=", c(1, 2, 3, 5)), paste0("Week, n=", c(1, 3, 5, 10)))))) %>%
+  ggplot(aes(or, lab, colour = data_source)) +
+  geom_vline(xintercept = 1, colour = "grey60", linetype = "dashed") +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.6), size = 0.25) +
+  scale_x_log10() +
+  scale_colour_manual(values = site_cols, name = NULL) +
+  labs(x = "Odds ratio, first n vs later (log scale)", y = NULL) +
+  theme(legend.position = "bottom")
+```
+
+Crude comparisons suggested lower positivity among the first cases (for example, `r num(fp("Uvira", "week", 1, "pct_first"))`% versus `r num(fp("Uvira", "week", 1, "pct_later"))`% for the first case of the week in Uvira), but this reflects busy periods having both more later cases and higher positivity. Within the same day or week, no stratified odds ratio differed clearly from one (@fig-first); for the first three cases of the day they were `r ci(fp("Sitakunda", "day", 3, "or"), fp("Sitakunda", "day", 3, "lo"), fp("Sitakunda", "day", 3, "hi"))` in Sitakunda and `r ci(fp("Uvira", "day", 3, "or"), fp("Uvira", "day", 3, "lo"), fp("Uvira", "day", 3, "hi"))` in Uvira, and for the first three of the week `r ci(fp("Sitakunda", "week", 3, "or"), fp("Sitakunda", "week", 3, "lo"), fp("Sitakunda", "week", 3, "hi"))` and `r ci(fp("Uvira", "week", 3, "or"), fp("Uvira", "week", 3, "lo"), fp("Uvira", "week", 3, "hi"))`. `r sum(first_pos$or > 1)` of `r nrow(first_pos)` point estimates were above one, although the comparisons overlap and are not independent. The intervals are wide enough to include differences that would matter for estimation, so these results do not establish that early and later cases are equivalent.
+
+@tbl-first-cov repeats the comparison for two case characteristics. In Uvira, the first three cases resembled later cases in the share of children under five and of severe cases. In Sitakunda, the first three recorded cases of a day were less often severe (OR `r with(filter(first_cov, data_source == "Sitakunda", unit == "day", var == "sample_severe_cases"), ci(or, lo, hi))`) and less often under five (OR `r with(filter(first_cov, data_source == "Sitakunda", unit == "day", var == "under5"), ci(or, lo, hi))`) than later cases on the same day. Recorded order in Sitakunda is therefore not unrelated to patient characteristics, although this did not translate into a detectable difference in positivity. Because Sitakunda timestamps may reflect registration rather than arrival, we cannot be certain whether this reflects who arrives first or how records were entered.
+
+```{r}
+#| label: tbl-first-cov
+#| tbl-colwidths: [12, 14, 8, 10, 10, 20, 26]
+#| tbl-cap: "Characteristics of the first three cases versus later cases in the same facility-day or facility-week. Severe follows the main text's severe-case definition."
+first_cov %>%
+  mutate(var = recode(var, under5 = "Under 5", sample_severe_cases = "Severe")) %>%
+  arrange(data_source, var, unit) %>%
+  transmute(Site = data_source, Characteristic = var, Period = unit,
+            `First 3 (%)` = num(pct_first), `Later (%)` = num(pct_later),
+            `Within-period diff. (pp)` = num(within_diff_pp), `MH OR (95% CI)` = ci(or, lo, hi)) %>%
+  kable(format = "pipe", align = c("l", "l", "l", "r", "r", "r", "r"))
+```
+
+# Comparison at matched test budgets {#sec-budget}
+
+The strategies in the main text use different numbers of tests, so comparing them confounds how many tests are used with how they are spread over time. This section separates the two with a stylised comparison. It differs from the main analysis in several ways listed below and should be read as a benchmark exercise, not as an evaluation of implementable strategies. Within each facility-year, six designs were given exactly the same number of tests, equal to the number that testing the first $n$ cases per day would use, for $n$ = 1, 2, 3 and 5:
+
+- **Daily first / daily random:** $\min(N_d, n)$ tests on each day $d$, taking the first cases or a random subset. Daily first is the main text's daily $n$ strategy applied to one facility-year.
+- **Annual random / annual systematic:** a simple random sample, or evenly spaced cases with a random start, across the facility-year. Both allocate tests in proportion to caseload, and both require the year's caseload to be known in advance, so they are statistical benchmarks rather than designs a surveillance system could run.
+- **Weekly first / weekly random:** the budget spread as evenly as possible across weeks with cases, capped at each week's caseload, taking the first cases or a random subset. These also require the annual caseload in advance, and differ from the main text's weekly $n$ strategy, which fixes the number of tests per week rather than per year.
+
+Other differences from the main analysis: errors are for facility-year totals rather than catchment incidence; weeks without a test were filled from the preceding 28 days of tests, or a positivity of 20% when none were available, rather than by the main text's imputation; and randomised designs were repeated `r bm_reps` times whereas daily first is deterministic and weekly first nearly so, so their errors are single realisations and not expectations. Estimates were formed by pooling and by summing weekly estimates. All weeks with cases were scored.
+
+```{r}
+#| label: fig-budget
+#| fig-cap: "Performance of six allocation designs at matched budgets. Points correspond to budgets equal to daily first n = 1, 2, 3 and 5. Rows: mean annual error of the pooled estimate and of the weekly-summed estimate (cases per facility-year); root mean squared error of weekly case counts (weekly-summed estimate); and the share of weeks with cases that received no test. Errors in weekly positivity are shown by weekly caseload in @fig-band."
+#| fig-width: 7.5
+#| fig-height: 7
+metrics <- c(
+  pooled_bias = "Annual bias, pooled\n(cases)",
+  weekly_bias = "Annual bias, weekly\n(cases)",
+  weekly_rmse = "Weekly count RMSE\n(cases)",
+  empty = "Weeks untested (%)"
+)
+bm_long <- bind_rows(
+  bm %>% filter(estimator == "pooled") %>% transmute(data_source, scheme, sf = sampling_fraction, metric = "pooled_bias", value = annual_bias_cases),
+  bm %>% filter(estimator == "weekly_prior_0.2") %>%
+    transmute(data_source, scheme, sf = sampling_fraction,
+              weekly_bias = annual_bias_cases, weekly_rmse = weekly_rmse_cases,
+              empty = 100 * empty_week_fraction) %>%
+    pivot_longer(weekly_bias:empty, names_to = "metric")
+) %>%
+  mutate(metric = factor(metric, names(metrics), metrics),
+         scheme = factor(scheme, names(bm_labels), bm_labels))
+ggplot(bm_long, aes(100 * sf, value, colour = scheme, shape = scheme)) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_line() + geom_point(size = 1.8) +
+  facet_grid(metric ~ data_source, scales = "free_y", switch = "y") +
+  scale_colour_manual(values = c("#0072B2", "#56B4E9", "#009E73", "#CC79A7", "#E69F00", "#555555"), name = NULL) +
+  scale_shape_manual(values = c(16, 1, 17, 2, 15, 0), name = NULL) +
+  labs(x = "Cases tested (%)", y = NULL) +
+  theme(legend.position = "bottom", strip.placement = "outside",
+        strip.text.y.left = element_text(angle = 0, hjust = 1, face = "plain")) +
+  guides(colour = guide_legend(nrow = 2), shape = guide_legend(nrow = 2))
+```
+
+```{r}
+#| label: fig-band
+#| fig-cap: "Errors at the matched budget equal to daily first n = 3, by the number of cases in the week. Rows: share of the week's cases tested; root mean squared error of weekly positivity and of weekly case counts (weekly-summed estimate)."
+#| fig-width: 7.5
+#| fig-height: 6
+band_metrics <- c(tested = "Cases tested (%)", pos = "Weekly positivity\nRMSE (pp)", count = "Weekly count\nRMSE (cases)")
+bm_band %>%
+  transmute(data_source, band = factor(band, bm_caseload_labels),
+            scheme = factor(scheme, names(bm_labels), bm_labels),
+            tested = 100 * mean_tests / mean_cases, pos = 100 * pos_rmse, count = count_rmse) %>%
+  pivot_longer(tested:count, names_to = "metric") %>%
+  mutate(metric = factor(metric, names(band_metrics), band_metrics)) %>%
+  ggplot(aes(band, value, colour = scheme, shape = scheme, group = scheme)) +
+  geom_line() + geom_point(size = 1.8) +
+  facet_grid(metric ~ data_source, scales = "free_y", switch = "y") +
+  scale_colour_manual(values = c("#0072B2", "#56B4E9", "#009E73", "#CC79A7", "#E69F00", "#555555"), name = NULL) +
+  scale_shape_manual(values = c(16, 1, 17, 2, 15, 0), name = NULL) +
+  labs(x = "Cases in the week", y = NULL) +
+  theme(legend.position = "bottom", strip.placement = "outside",
+        strip.text.y.left = element_text(angle = 0, hjust = 1, face = "plain")) +
+  guides(colour = guide_legend(nrow = 2), shape = guide_legend(nrow = 2))
+```
+
+```{r}
+#| label: budget-values
+bb <- function(src, scheme, band, col) {
+  z <- bm_band[[col]][bm_band$data_source == src & bm_band$scheme == scheme & bm_band$band == band]
+  stopifnot(length(z) == 1)
+  z
+}
+cap_bias <- bm %>% filter(estimator == "pooled", !grepl("annual", scheme))
+prop_bias <- bm %>% filter(estimator == "pooled", grepl("annual", scheme))
+wk_all <- bm %>% filter(estimator == "weekly_prior_0.2", scheme != "weekly_first")
+design_ratio <- wk_all %>% group_by(data_source, daily_cap) %>%
+  summarise(r = max(weekly_rmse_cases) / min(weekly_rmse_cases), .groups = "drop")
+pos3 <- function(pat) {
+  z <- 100 * wk_all$positivity_rmse[wk_all$data_source == "Uvira" & wk_all$daily_cap == 3 & grepl(pat, wk_all$scheme)]
+  if (num(min(z), 0) == num(max(z), 0)) num(min(z), 0) else paste0(num(min(z), 0), "–", num(max(z), 0))
+}
+uv_quiet <- num(100 * sum(bm_band$week_share[bm_band$data_source == "Uvira" & bm_band$scheme == "daily_first" & bm_band$band %in% c("1-2", "3-5")]), 0)
+```
+
+From these comparisons we learn the following:
+
+1. **At a fixed budget, allocation made little difference to mean annual error or weekly count error once weekly estimates were summed.** With pooled estimates, all daily and weekly allocations underestimated, as @eq-bias predicts, by `r num(min(abs(cap_bias$annual_bias_cases)))` to `r num(max(abs(cap_bias$annual_bias_cases)))` cases per facility-year, against within `r num(max(abs(prop_bias$annual_bias_cases)))` cases for the caseload-proportional designs. With weekly summing, mean annual errors for all designs except weekly first were between `r num(min(wk_all$annual_bias_cases))` and `r num(max(wk_all$annual_bias_cases))` cases, and weekly count RMSE differed between these designs by a factor of at most `r num(max(design_ratio$r), 1)` at any budget.
+2. **Allocation did determine which weeks were estimated well.** A daily cap tests every case on days with $n$ or fewer cases, so it spends a larger share of the budget on quiet weeks and a smaller share on busy ones than a caseload-proportional design does (@fig-band, at the $n=3$ budget). In Uvira, where weeks with five or fewer cases made up `r uv_quiet`% of case-bearing weeks, this gave daily designs a weekly positivity RMSE of `r pos3("^daily")` percentage points against `r pos3("^annual")` for the caseload-proportional designs, which left `r num(100 * bb("Uvira", "annual_systematic", "1-2", "untested"), 0)`% of weeks with one or two cases untested. The difference does not carry over to weekly counts, because a week's count error is its caseload times its positivity error and so comes mostly from busy weeks, where the proportional designs have slightly more tests. Sitakunda had few quiet weeks and the designs differed less.
